@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Fallbacks for a host that installs the overlay without passing its own tokens.
+      A host that has semantic colours should pass them instead: see AdLogConfig.
+    -->
+    <color name="adlog_surface">#FFFFFF</color>
+    <color name="adlog_heading">#1B1B1B</color>
+    <color name="adlog_subtext">#6B6B6B</color>
+    <color name="adlog_border">#E0E0E0</color>
+    <color name="adlog_container">#EFEFEF</color>
+</resources>

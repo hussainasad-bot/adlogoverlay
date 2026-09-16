@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!--
+          Installs the overlay before Application.onCreate, so adding the dependency is the whole
+          integration. Not exported: nothing outside the app can reach it, and it serves no data.
+          See AdLogInitProvider for how a host customises or removes it.
+        -->
+        <provider
+            android:name="com.ninedtechnologies.adlogoverlay.AdLogInitProvider"
+            android:authorities="${applicationId}.adlogoverlay-init"
+            android:exported="false" />
+    </application>
+
+</manifest>

@@ -1,0 +1,42 @@
+name: Publish to Maven Central
+
+# Runs when a tag like v1.0.0 is pushed. It UPLOADS the release to the Central Portal but does not
+# release it: someone must press Publish on central.sonatype.com. A released version can never be
+# changed or deleted, so that last step stays with a person.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches VERSION_NAME
+        run: |
+          expected="v$(grep '^VERSION_NAME=' gradle.properties | cut -d= -f2)"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match VERSION_NAME in gradle.properties ($expected)"
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Test
+        run: ./gradlew :adlogoverlay:testDebugUnitTest
+
+      - name: Upload to the Central Portal
+        run: ./gradlew publishToMavenCentral
+        env:
+          # The POM's project and source links point at the repository running this workflow.
+          ORG_GRADLE_PROJECT_GITHUB_REPO: ${{ github.repository }}
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
