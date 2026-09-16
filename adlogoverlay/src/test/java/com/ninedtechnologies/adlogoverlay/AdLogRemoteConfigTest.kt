@@ -178,6 +178,78 @@ class AdLogRemoteConfigTest {
         assertEquals(listOf(RemoteConfigRow(0, null, "{\"a\":")), rc.rowsForValue("x", "{\"a\":"))
     }
 
+    // ------------------------------------------------------------------------ folding
+
+    private fun heading(depth: Int, label: String) = RemoteConfigRow(depth, label, null, heading = true)
+    private fun field(depth: Int, label: String, value: String = "x") = RemoteConfigRow(depth, label, value)
+
+    // ads_config
+    //   Home       (heading, depth 0)
+    //     Type       Native
+    //     Sizes    (heading, depth 1)
+    //       Small    Yes
+    //   Home       (a second group with the same name)
+    //     Type       Banner
+    //   Exit       (heading with nothing under it)
+    private val foldRows = listOf(
+        heading(0, "Home"), field(1, "Type", "Native"), heading(1, "Sizes"), field(2, "Small", "Yes"),
+        heading(0, "Home"), field(1, "Type", "Banner"),
+        heading(0, "Exit")
+    )
+
+    @Test
+    fun headingPathsFollowTheChainAndNumberSameNamedSiblings() {
+        assertEquals(
+            listOf("cfg/Home#1", null, "cfg/Home#1/Sizes#1", null, "cfg/Home#2", null, "cfg/Exit#1"),
+            rc.headingPaths("cfg", foldRows)
+        )
+    }
+
+    @Test
+    fun nothingFoldedShowsEveryRowAndMarksWhatCanFold() {
+        val visible = rc.visibleRows("cfg", foldRows, emptySet())
+        assertEquals(foldRows, visible.map { it.row })
+        assertEquals(listOf(true, false, true, false, true, false, false), visible.map { it.canFold })
+        assertTrue(visible.none { it.folded })
+    }
+
+    @Test
+    fun foldingAGroupHidesOnlyItsOwnRows() {
+        val visible = rc.visibleRows("cfg", foldRows, setOf("cfg/Home#1"))
+        assertEquals(
+            listOf(heading(0, "Home"), heading(0, "Home"), field(1, "Type", "Banner"), heading(0, "Exit")),
+            visible.map { it.row }
+        )
+        assertEquals(3, visible[0].hiddenRows)
+        assertTrue(visible[0].folded)
+        assertFalse(visible[1].folded)
+    }
+
+    @Test
+    fun foldingANestedGroupKeepsItsParentOpen() {
+        val visible = rc.visibleRows("cfg", foldRows, setOf("cfg/Home#1/Sizes#1"))
+        assertEquals(foldRows.size - 1, visible.size)
+        val sizes = visible.first { it.path == "cfg/Home#1/Sizes#1" }
+        assertTrue(sizes.folded)
+        assertEquals(1, sizes.hiddenRows)
+    }
+
+    @Test
+    fun aHeadingWithNothingUnderItNeverFolds() {
+        val visible = rc.visibleRows("cfg", foldRows, setOf("cfg/Exit#1"))
+        val exit = visible.last()
+        assertFalse(exit.folded)
+        assertFalse(exit.canFold)
+    }
+
+    @Test
+    fun aFoldedGroupSaysWhenItHidesASearchMatch() {
+        val folded = setOf("cfg/Home#1")
+        assertTrue(rc.visibleRows("cfg", foldRows, folded, "native")[0].hiddenMatch)
+        assertFalse(rc.visibleRows("cfg", foldRows, folded, "banner")[0].hiddenMatch)
+        assertFalse(rc.visibleRows("cfg", foldRows, folded, "")[0].hiddenMatch)
+    }
+
     // ------------------------------------------------------- topLevelArrayElements
 
     @Test

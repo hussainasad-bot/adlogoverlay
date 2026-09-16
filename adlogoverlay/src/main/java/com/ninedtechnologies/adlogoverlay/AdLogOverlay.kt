@@ -78,7 +78,7 @@ import android.widget.Toast
  *
  * Drag the collapsed bubble towards the bottom of the screen and a ✕ target appears; drop the
  * bubble on it and the overlay is removed from every screen - no panel, no bubble. Shake the
- * phone to bring the bubble back. See [dismiss] and [reopen].
+ * phone to bring it back, with the panel open. See [dismiss] and [reopen].
  *
  * Dismissal lasts for the process only: a relaunch always shows the bubble again, so nobody is
  * left with an overlay they cannot find.
@@ -206,14 +206,15 @@ object AdLogOverlay {
     }
 
     /**
-     * Brings the bubble back after [dismiss]. A shake calls this; public so a host can wire its
+     * Brings the overlay back after [dismiss], with the panel open. A shake calls this; public so a host can wire its
      * own trigger, e.g. for a device with no accelerometer.
      */
     fun reopen() {
         if (!dismissed) return
         dismissed = false
-        // Back as the bubble, never straight into an open panel over whatever the tester is doing.
-        collapsed = true
+        // Back with the panel open: a shake is a deliberate "show me the log", so it should not
+        // need a second tap on the bubble.
+        collapsed = false
         updateShakeListening()
         started.toList().forEach(::attach)
         started.lastOrNull()?.let { root(it)?.findViewWithTag<AdLogView>(TAG)?.confirmReopened() }

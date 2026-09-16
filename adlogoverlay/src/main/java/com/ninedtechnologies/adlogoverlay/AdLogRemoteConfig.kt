@@ -106,6 +106,21 @@ data class RemoteConfigRow(
     val detail: String? = null
 )
 
+/**
+ * One row as drawn after folding. [path] identifies a heading across redraws - a search, a refresh,
+ * a screen change - so a folded group stays folded; it is null for rows that are not headings.
+ * [canFold] is false for a heading with nothing under it. A folded heading carries how many rows it
+ * hides, and whether any of them matches the current search.
+ */
+data class RemoteConfigVisibleRow(
+    val row: RemoteConfigRow,
+    val path: String? = null,
+    val canFold: Boolean = false,
+    val folded: Boolean = false,
+    val hiddenRows: Int = 0,
+    val hiddenMatch: Boolean = false
+)
+
 private val JSON_NUMBER = Regex("-?(0|[1-9]\\d*)(\\.\\d+)?([eE][+-]?\\d+)?")
 
 /**
@@ -584,6 +599,76 @@ object AdLogRemoteConfig {
         return array.items.joinToString(", ") { friendlyValue(key, it, labels).first }
             .takeIf { it.length <= INLINE_LIST_CHARS }
     }
+
+    // ---------------------------------------------------------------------------- folding
+
+    /**
+     * A stable identity for every heading in [rows]; null for rows that are not headings.
+     *
+     * Built from the chain of headings above the row - `ads_config/Home native ad#1/Sizes#1` - not
+     * from its position, so a refresh that adds rows elsewhere does not unfold the wrong group.
+     * The `#n` tells apart headings with the same name under the same parent.
+     */
+    fun headingPaths(entryKey: String, rows: List<RemoteConfigRow>): List<String?> {
+        val stack = ArrayList<String>()
+        val seen = HashMap<String, Int>()
+        return rows.map { row ->
+            if (!row.heading) return@map null
+            while (stack.size > row.depth) stack.removeAt(stack.size - 1)
+            while (stack.size < row.depth) stack.add("_")
+            val parent = (listOf(entryKey) + stack).joinToString("/")
+            val label = row.label.orEmpty()
+            val n = (seen["$parent|$label"] ?: 0) + 1
+            seen["$parent|$label"] = n
+            stack.add("$label#$n")
+            (listOf(entryKey) + stack).joinToString("/")
+        }
+    }
+
+    /**
+     * [rows] as drawn when the headings in [folded] are folded: each folded heading stays, and the
+     * rows under it - everything after it that sits deeper - are left out and counted instead.
+     * [folded] holds paths from [headingPaths].
+     */
+    fun visibleRows(
+        entryKey: String,
+        rows: List<RemoteConfigRow>,
+        folded: Set<String>,
+        query: String = ""
+    ): List<RemoteConfigVisibleRow> {
+        val paths = headingPaths(entryKey, rows)
+        val out = ArrayList<RemoteConfigVisibleRow>(rows.size)
+        var i = 0
+        while (i < rows.size) {
+            val row = rows[i]
+            val path = paths[i]
+            if (path == null) {
+                out += RemoteConfigVisibleRow(row)
+                i++
+                continue
+            }
+            var end = i + 1
+            while (end < rows.size && rows[end].depth > row.depth) end++
+            val under = rows.subList(i + 1, end)
+            if (under.isNotEmpty() && path in folded) {
+                out += RemoteConfigVisibleRow(
+                    row, path, canFold = true, folded = true,
+                    hiddenRows = under.size, hiddenMatch = anyMentions(under, query)
+                )
+                i = end
+            } else {
+                out += RemoteConfigVisibleRow(row, path, canFold = under.isNotEmpty())
+                i++
+            }
+        }
+        return out
+    }
+
+    /** True when [query] appears in anything [rows] would show. */
+    fun anyMentions(rows: List<RemoteConfigRow>, query: String): Boolean =
+        query.isNotEmpty() && rows.any { row ->
+            listOfNotNull(row.label, row.value, row.detail).any { it.contains(query, ignoreCase = true) }
+        }
 
     // ------------------------------------------------------------------------- JSON
 

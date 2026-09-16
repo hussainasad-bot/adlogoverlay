@@ -85,7 +85,8 @@ The overlay starts collapsed as a small `AD` bubble.
 | Tap the bubble | Opens the panel |
 | Drag the bubble | Moves it; on release it snaps to the nearer screen edge at the height you left it |
 | Drop the bubble on the ✕ | A ✕ rises near the bottom while you drag. Drop the bubble on it to close the overlay on every screen |
-| Shake the phone | Brings the bubble back after it was closed |
+| Shake the phone | Brings the overlay back, with the panel open, after it was closed |
+| Tap a `▾` / `▸` line (FRC tab) | Folds or unfolds that setting, ad placement or nested object |
 | Drag the `⠿` header | Moves the panel up and down |
 | Drag the log area | Scrolls back through history |
 | `ADS` / `FRC` tabs | Switch between the ad log and the app's Remote Config. `FRC` appears only if the app uses Firebase Remote Config |
@@ -116,7 +117,7 @@ Drag the bubble and a ✕ target rises near the bottom. Bring the bubble close: 
 target, the target turns red and the phone ticks, so you know letting go will close it. Release
 and the overlay leaves every screen, with a message saying how to get it back.
 
-**Shake the phone to bring it back** — three firm jolts. Setting the phone down or walking does
+**Shake the phone to bring it back, with the panel open** — three firm jolts. Setting the phone down or walking does
 not count. Relaunching the app always brings it back too. On a device with no accelerometer the ✕
 is never offered, so the overlay cannot be closed with no way back.
 
@@ -136,9 +137,9 @@ Settings       12 in total  ·  12 from Firebase  ·  0 built-in
 Download rule  Can re-download any time  ·  waits up to 1 minute
 Refresh        Tap REFRESH to download the latest settings
 
-Ads config  FROM FIREBASE
+▾ Ads config  FROM FIREBASE
 ads_config
-  ▸ Home native ad  Home_NATIVE_AD
+  ▾ Home native ad  Home_NATIVE_AD
       Ad type                 Native (2)
       Show loading before ad  No
       Ad ID                   ca-app-pub-3940256099942544/2247696110 (Google test ad)
@@ -147,6 +148,11 @@ Show onboarding  BUILT-IN DEFAULT
 show_onboarding
   Yes
 ```
+
+**Fold what you are not looking at.** Tap any `▾` line to fold it and `▸` to open it again: a
+setting's title folds the whole setting, a placement folds that placement, a nested object folds
+just that object. A folded line says how many lines it hides, and "has matches" when a search hit
+is inside. Folds stay as you left them across `REFRESH`, searches and screen changes.
 
 **Read the top block first.** "Last download" says whether anything below came from Firebase at
 all. Anything other than `✓ Downloaded` comes with a line saying what you are seeing instead.

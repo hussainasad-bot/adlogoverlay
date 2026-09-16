@@ -19,6 +19,7 @@ import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.animation.DecelerateInterpolator
@@ -131,6 +132,13 @@ class AdLogView(context: Context) : FrameLayout(context) {
          * Main thread only; views leave the set on detach, so nothing off screen is held.
          */
         private val attachedViews = LinkedHashSet<AdLogView>()
+
+        /**
+         * FRC groups the tester folded, by the paths from AdLogRemoteConfig.headingPaths - or, for a
+         * whole setting, its key. Kept here, not in the view, so a folded group stays folded across
+         * refreshes, searches and screen changes. Main thread only.
+         */
+        private val foldedFrc = HashSet<String>()
 
         /**
          * Per-value ceiling in the FRC view. A Remote Config value can be an arbitrarily large
@@ -308,6 +316,8 @@ class AdLogView(context: Context) : FrameLayout(context) {
             isClickable = false
             setTextIsSelectable(false)
         }
+        // FRC tab only: a tap on a fold line folds or unfolds it. See TapToFold.
+        logText.setOnTouchListener(TapToFold())
         // The log area deliberately takes vertical drags so history can be scrolled back;
         // everywhere else on the panel still falls through to the app.
         scroller = ScrollView(context).apply {
@@ -985,7 +995,8 @@ class AdLogView(context: Context) : FrameLayout(context) {
 
     /** Called by [AdLogOverlay.reopen] - the buzz is the confirmation that the shake registered. */
     internal fun confirmReopened() {
-        bubble.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        // On the view itself: after a shake the panel is open and the bubble is hidden.
+        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
     }
 
     // ------------------------------------------------------------- bubble geometry
@@ -1324,12 +1335,58 @@ class AdLogView(context: Context) : FrameLayout(context) {
         if (frcOpen && !collapsed) renderRemoteConfig(resetScroll = false)
     }
 
+    /** A tappable fold line in the FRC text: [start] to [end] folds or unfolds [key]. */
+    private class FoldTarget(val start: Int, val end: Int, val key: String)
+
+    /** Fold lines in the text currently shown; rebuilt with it. */
+    private var foldTargets: List<FoldTarget> = emptyList()
+
+    /**
+     * FRC tab: a tap on a ▾ / ▸ line folds or unfolds that group. Only a tap - a drag still scrolls,
+     * because the ScrollView takes the gesture over, and cancels it here, once it moves.
+     */
+    private inner class TapToFold : OnTouchListener {
+        private var downX = 0f
+        private var downY = 0f
+        private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+
+        @SuppressLint("ClickableViewAccessibility")
+        override fun onTouch(v: View, e: MotionEvent): Boolean {
+            // The ADS tab keeps its text inert, exactly as before.
+            if (!frcOpen || foldTargets.isEmpty()) return false
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = e.x
+                    downY = e.y
+                }
+                MotionEvent.ACTION_UP -> if (abs(e.x - downX) <= slop && abs(e.y - downY) <= slop) {
+                    // Anywhere on a fold line counts, including the empty space after its text.
+                    val offset = logText.getOffsetForPosition(e.x, e.y)
+                    foldTargets.firstOrNull { offset >= it.start && offset < it.end }?.let {
+                        v.performClick()
+                        toggleFold(it.key)
+                    }
+                }
+            }
+            return true
+        }
+    }
+
+    private fun toggleFold(key: String) {
+        if (!foldedFrc.remove(key)) foldedFrc.add(key)
+        logText.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        // Keep the scroll position: the tapped line stays under the finger.
+        renderRemoteConfig(resetScroll = false)
+    }
+
     private fun renderRemoteConfig(resetScroll: Boolean) {
         val keepY = scroller.scrollY
         // The log's trim bookkeeping does not apply to this text; renderAll() rebuilds it from
         // zero when the log view returns.
         lineCount = 0
-        logText.text = formatRemoteConfig(lastFrc, AdLogFilter.query)
+        val targets = ArrayList<FoldTarget>()
+        logText.text = formatRemoteConfig(lastFrc, AdLogFilter.query, targets)
+        foldTargets = targets
         scroller.post { scroller.scrollTo(0, if (resetScroll) 0 else keepY) }
     }
 
@@ -1352,7 +1409,11 @@ class AdLogView(context: Context) : FrameLayout(context) {
      *           Show loading before ad  No
      *           Ad ID                   ca-app-pub-…/1033173712 (Google test ad)
      */
-    private fun formatRemoteConfig(snap: RemoteConfigSnapshot?, query: String): SpannableStringBuilder {
+    private fun formatRemoteConfig(
+        snap: RemoteConfigSnapshot?,
+        query: String,
+        foldTargets: MutableList<FoldTarget>
+    ): SpannableStringBuilder {
         val sb = SpannableStringBuilder()
         val charWidth = logText.paint.measureText("0")
 
@@ -1457,7 +1518,13 @@ class AdLogView(context: Context) : FrameLayout(context) {
         }
 
         for ((entry, match) in shown) {
+            val rows = AdLogRemoteConfig.rowsForValue(entry.key, match.value, labels)
+            // A single value has nothing to fold away; JSON with rows under it does.
+            val canFold = rows.size > 1
+            val folded = canFold && entry.key in foldedFrc
             sb.append("\n")
+            val titleStart = sb.length
+            if (canFold) sb.appendStyled(if (folded) "▸ " else "▾ ", palette.heading, bold = true)
             // The setting in plain words, where its value came from, and whether REFRESH changed it.
             sb.appendStyled(AdLogRemoteConfig.humanize(entry.key), palette.heading, bold = true)
             sb.appendStyled("  ${entry.source.label}", colorOf(entry.source), bold = true)
@@ -1471,7 +1538,14 @@ class AdLogView(context: Context) : FrameLayout(context) {
                 sb.appendStyled("  ·  ${match.matched} of ${match.total} items match", palette.subtext)
             }
             sb.append("\n")
-            appendRows(sb, AdLogRemoteConfig.rowsForValue(entry.key, match.value, labels), charWidth)
+            // Both title lines fold the whole setting - a bigger target than the arrow alone.
+            if (canFold) foldTargets += FoldTarget(titleStart, sb.length, entry.key)
+            if (folded) {
+                val hint = if (AdLogRemoteConfig.anyMentions(rows, query)) "  ·  has matches" else ""
+                sb.appendStyled("  ${rows.size} lines hidden$hint  ·  tap to show\n", palette.subtext)
+            } else {
+                appendRows(sb, entry.key, rows, query, charWidth, foldTargets)
+            }
         }
 
         // Underlined in place, same treatment as a match in the log.
@@ -1494,44 +1568,70 @@ class AdLogView(context: Context) : FrameLayout(context) {
     }
 
     /**
-     * Readable rows (see [AdLogRemoteConfig.rowsForValue]) as indented text. Settings next to each
-     * other share one label column so their values line up like a table, and each top-level
-     * group - one ad placement - gets a blank line above it.
+     * Readable rows (see [AdLogRemoteConfig.rowsForValue]) as indented text, with folded groups left
+     * out. Settings next to each other share one label column so their values line up like a
+     * table, and each top-level group - one ad placement - gets a blank line above it.
      */
-    private fun appendRows(sb: SpannableStringBuilder, rows: List<RemoteConfigRow>, charWidth: Float) {
-        val shown = if (rows.size > MAX_FRC_ROWS) rows.subList(0, MAX_FRC_ROWS) else rows
+    private fun appendRows(
+        sb: SpannableStringBuilder,
+        entryKey: String,
+        rows: List<RemoteConfigRow>,
+        query: String,
+        charWidth: Float,
+        foldTargets: MutableList<FoldTarget>
+    ) {
+        val limited = if (rows.size > MAX_FRC_ROWS) rows.subList(0, MAX_FRC_ROWS) else rows
+        val shown = AdLogRemoteConfig.visibleRows(entryKey, limited, foldedFrc, query)
         var i = 0
         while (i < shown.size) {
-            val first = shown[i]
+            val first = shown[i].row
             var end = i
-            while (end < shown.size && shown[end].depth == first.depth &&
-                !shown[end].heading && shown[end].label != null
+            while (end < shown.size && shown[end].row.depth == first.depth &&
+                !shown[end].row.heading && shown[end].row.label != null
             ) end++
             if (end == i) {
                 if (first.heading && first.depth == 0 && i > 0) sb.append("\n")
-                appendRow(sb, first, 0, charWidth)
+                appendRow(sb, shown[i], 0, charWidth, foldTargets)
                 i++
             } else {
-                val width = shown.subList(i, end).maxOf { it.label?.length ?: 0 }.coerceAtMost(MAX_LABEL_CHARS)
-                for (k in i until end) appendRow(sb, shown[k], width, charWidth)
+                val width = shown.subList(i, end).maxOf { it.row.label?.length ?: 0 }.coerceAtMost(MAX_LABEL_CHARS)
+                for (k in i until end) appendRow(sb, shown[k], width, charWidth, foldTargets)
                 i = end
             }
         }
-        if (rows.size > shown.size) {
-            val more = rows.size - shown.size
-            appendRow(sb, RemoteConfigRow(0, null, "… $more more lines - FIND narrows this", RemoteConfigRowKind.NOTE), 0, charWidth)
+        if (rows.size > limited.size) {
+            val more = rows.size - limited.size
+            val note = RemoteConfigRow(0, null, "… $more more lines - FIND narrows this", RemoteConfigRowKind.NOTE)
+            appendRow(sb, RemoteConfigVisibleRow(note), 0, charWidth, foldTargets)
         }
     }
 
-    private fun appendRow(sb: SpannableStringBuilder, row: RemoteConfigRow, labelWidth: Int, charWidth: Float) {
+    private fun appendRow(
+        sb: SpannableStringBuilder,
+        visible: RemoteConfigVisibleRow,
+        labelWidth: Int,
+        charWidth: Float,
+        foldTargets: MutableList<FoldTarget>
+    ) {
+        val row = visible.row
         val start = sb.length
         val indent = 2 + 2 * row.depth
         sb.append(" ".repeat(indent))
         val label = row.label
         val hangChars = when {
             row.heading -> {
-                sb.appendStyled("▸ ${label.orEmpty()}", palette.heading, bold = true)
+                // ▾ open, ▸ folded, • nothing under it to fold.
+                val arrow = when {
+                    !visible.canFold -> "• "
+                    visible.folded -> "▸ "
+                    else -> "▾ "
+                }
+                sb.appendStyled("$arrow${label.orEmpty()}", palette.heading, bold = true)
                 row.detail?.let { sb.appendStyled("  $it", palette.subtext) }
+                if (visible.folded) {
+                    val hint = if (visible.hiddenMatch) "  ·  has matches" else ""
+                    sb.appendStyled("  ·  ${visible.hiddenRows} hidden$hint", palette.subtext)
+                }
                 indent + 2
             }
             label != null -> {
@@ -1547,6 +1647,8 @@ class AdLogView(context: Context) : FrameLayout(context) {
         }
         sb.append("\n")
         hang(sb, start, hangChars, charWidth)
+        val path = visible.path
+        if (visible.canFold && path != null) foldTargets += FoldTarget(start, sb.length, path)
     }
 
     private fun appendRowValue(sb: SpannableStringBuilder, row: RemoteConfigRow) {
