@@ -12,6 +12,8 @@ import kotlinx.coroutines.launch
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.ArrayDeque
+import java.util.Locale
+import java.util.TimeZone
 
 /**
  * What kind of ad moment a line describes. The only job of this is colour: every entry is
@@ -59,14 +61,26 @@ enum class AdLogKind(val label: String, val onDark: Int, val onLight: Int) {
         /** "click" but never "doubleclick" - see the CLICK branch below. */
         private val CLICK_RE = Regex("(?<!double)click", RegexOption.IGNORE_CASE)
 
+        /** `key=value` or `"key":` - three of them make a line a dump of data, not an event. */
+        private val DATA_PAIR = Regex("""\w=|":""")
+
         /**
          * Classify a line. ORDER IS LOAD-BEARING - the first match wins, so the compound
          * phrases must be tested before the words they contain:
          * "onAdFailedToShowFullScreenContent" holds both "failed" and "show" (FAILED wins);
          * "paid_ad_impression" holds "impression" (PAID wins).
+         *
+         * Two things are taken out before any word is looked for:
+         *  - **Slot names.** `Click_PDF_INTER_AD_3 Ad loaded request` is a request, but its slot's
+         *    name says "click"; `LANGUAGE_INTER_SPLASH_FAIL_AD` is not a failure. See
+         *    [AdPlacement.withoutPlacements].
+         *  - **Data dumps.** `AdConfig(adName=Home_NATIVE_AD, isShowLoadingBeforeAd=true, ...)` lists
+         *    settings; its "loading" is not a request. Google's own error JSON (`"Code": 3, ...`) is the
+         *    exception - that one is a failure.
          */
         fun of(line: String): AdLogKind {
-            val s = line.lowercase()
+            val s = AdPlacement.withoutPlacements(line).lowercase()
+            if (DATA_PAIR.findAll(s).take(3).count() == 3 && !s.contains("\"code\"")) return OTHER
             return when {
                 // revenue first - its strings contain "impression"
                 s.contains("onpaidevent") || s.contains("paid_ad_impression") ||
@@ -111,6 +125,10 @@ enum class AdLogKind(val label: String, val onDark: Int, val onLight: Int) {
                     s.contains("shown") || s.contains("onadopened") ||
                     s.contains("displaying") -> SHOWN
 
+                // "Home_NATIVE_AD_2 Ad loaded request" is a wrapper announcing the REQUEST it is about to
+                // send; without this it reads as the load itself, and every request counts twice.
+                s.contains("loaded request") || s.contains("load request") -> REQUEST
+
                 s.contains("loaded") -> LOADED
 
                 s.contains("request") || s.contains("calling") || s.contains("loading") ||
@@ -138,7 +156,15 @@ data class AdLogEntry(
     /** Screen that was on top when this line was read - see [AdLogStore.currentScreen]. */
     val screen: String? = null,
     /** Plain-language "why" for a failure or a refusal; null for everything else. */
-    val reason: String? = null
+    val reason: String? = null,
+    /** When it happened, in epoch millis - [time] resolved against today. What durations are measured with. */
+    val atMillis: Long = System.currentTimeMillis(),
+    /** LOADED lines: time since the REQUESTED for the same slot. See [AdLogStats]. */
+    val loadMillis: Long? = null,
+    /** CLICKED lines: set when the click came so soon after the ad appeared that it was likely accidental. */
+    val fastClickMillis: Long? = null,
+    /** A tester's divider from TOOLS > MARK, numbered from 1; null for every real log line. */
+    val mark: Int? = null
 ) {
     /**
      * Everything this line can be searched by, lower-cased once at ingest. Search then costs
@@ -149,6 +175,8 @@ data class AdLogEntry(
         placement?.let { append(' ').append(it) }
         screen?.let { append(' ').append(it) }
         reason?.let { append(' ').append(it) }
+        if (fastClickMillis != null) append(" fast click")
+        mark?.let { append(" mark ").append(it) }
     }.lowercase()
 }
 
@@ -175,16 +203,59 @@ object AdPlacement {
         RegexOption.IGNORE_CASE
     )
 
+    /**
+     * What a wrapper glues onto the slot when something fails: "APP_OPEN_5_error_No fill" tokenises
+     * as `APP_OPEN_5_error_No`, which would otherwise count as a slot of its own.
+     */
+    private val FAILURE_TAIL = Regex("""_(?:error|failed)(?:_.*)?$""", RegexOption.IGNORE_CASE)
+
+    /** A numeric type suffix, as in `APP_OPEN_5` - see [canonical]. */
+    private val NUMBERED = Regex("""_\d+$""")
+
     fun of(message: String): String? {
-        for (m in TOKEN.findAll(message)) {
-            var t = m.groupValues[1]
-            if (!FORMAT.containsMatchIn(t)) continue
-            // Never mistake a class or package name for a placement.
-            if (t.contains('.') || t.startsWith("com_")) continue
-            t = VERB_SUFFIX.replace(t, "")
-            if (t.length in 3..48) return t
-        }
+        for (m in TOKEN.findAll(message)) slotIn(m.value)?.let { return it }
         return null
+    }
+
+    /**
+     * [text] with every slot name blanked, keeping what was glued onto it: `home_native_ad_impression`
+     * keeps `_impression`, `APP_OPEN_5_error_No` keeps `_error_No`. Classification reads this, so a
+     * slot called `Click_PDF_INTER_AD` cannot make its own requests look like clicks.
+     */
+    fun withoutPlacements(text: String): String = TOKEN.replace(text) { m ->
+        val slot = slotIn(m.value) ?: return@replace m.value
+        m.value.replaceFirst(slot, " ")
+    }
+
+    private fun slotIn(token: String): String? {
+        if (!FORMAT.containsMatchIn(token)) return null
+        // Never mistake a class or package name for a placement.
+        if (token.contains('.') || token.startsWith("com_")) return null
+        val t = VERB_SUFFIX.replace(FAILURE_TAIL.replace(token, ""), "")
+        return t.takeIf { it.length in 3..48 }
+    }
+
+    /**
+     * One name per slot, given the slots already seen. Wrappers that end a slot's name with a
+     * numeric type (`REWARDED_6`) do not always log it the same way:
+     *
+     *  - `REWARDED_6_No fill` glues the error message on - `REWARDED_6_No` becomes `REWARDED_6`;
+     *  - `Destroyed REWARDED` drops the type - `REWARDED` becomes `REWARDED_6`, if that is the only
+     *    numbered slot it could be.
+     *
+     * Both rules need the numeric suffix, so `Exit_Native` and `Exit_Native_Bottom` - two real slots -
+     * are never merged. Case is ignored; the name first seen is kept.
+     */
+    fun canonical(raw: String, known: Collection<String>): String {
+        known.firstOrNull { it.equals(raw, ignoreCase = true) }?.let { return it }
+        known.filter { NUMBERED.containsMatchIn(it) && raw.startsWith(it + "_", ignoreCase = true) }
+            .maxByOrNull { it.length }
+            ?.let { return it }
+        known.singleOrNull {
+            it.startsWith(raw + "_", ignoreCase = true) && it.length > raw.length + 1 &&
+                it.substring(raw.length + 1).all(Char::isDigit)
+        }?.let { return it }
+        return raw
     }
 
     /** Coarse format for the line, derived from the slot name. */
@@ -364,6 +435,55 @@ object AdLogStore {
     @Synchronized
     fun snapshot(): List<AdLogEntry> = buffer.toList()
 
+    /** Per-slot counts for the STATS tab and SHARE - see [AdLogStats]. Unlike the log, never trimmed. */
+    private val stats = AdLogStats(System.currentTimeMillis())
+
+    @Synchronized
+    internal fun stats(): AdStatsSnapshot = stats.snapshot()
+
+    /** Fast clicks since the session started; drives the dot on the STATS tab. */
+    @Volatile
+    var fastClickCount: Int = 0
+        private set
+
+    private var markCount = 0
+
+    /**
+     * Drops a numbered divider into the log - TOOLS > MARK - so a tester can say "the bug is after
+     * mark 3". Bypasses the rate limit: a tester's own mark must never be the line that is dropped.
+     */
+    @Synchronized
+    fun mark(): Int {
+        markCount++
+        val now = System.currentTimeMillis()
+        val entry = AdLogEntry(
+            nowClock(now), "AdLog", "MARK $markCount", AdLogKind.OTHER,
+            atMillis = now, mark = markCount
+        )
+        if (buffer.size >= MAX_ENTRIES) buffer.removeFirst()
+        buffer.addLast(entry)
+        listeners.toList().forEach { it(entry) }
+        return markCount
+    }
+
+    /**
+     * TOOLS > CLEAR: a fresh start for the next test run. Empties the log, the stats, the marks and the
+     * values the filter offers, and restarts the session clock. The reader keeps running.
+     */
+    @Synchronized
+    fun clear() {
+        val now = System.currentTimeMillis()
+        buffer.clear()
+        stats.clear(now)
+        fastClickCount = 0
+        markCount = 0
+        dropped = 0
+        screensSeen.clear()
+        placementsSeen.clear()
+        reasonsSeen.clear()
+        facetVersion++
+    }
+
     @Synchronized
     fun addListener(l: (AdLogEntry) -> Unit) { listeners += l }
 
@@ -382,12 +502,21 @@ object AdLogStore {
     private var dropped = 0
 
     @Synchronized
-    private fun record(entry: AdLogEntry) {
+    private fun record(raw: AdLogEntry) {
+        // One name per slot, then counted - both BEFORE the rate limit, so a burst that hides lines
+        // from the panel never hides events from the stats.
+        val named = raw.placement?.let { p ->
+            val canonical = AdPlacement.canonical(p, stats.placements)
+            if (canonical == p) raw else raw.copy(placement = canonical)
+        } ?: raw
+        val entry = stats.onEntry(named, AdLogOverlay.config.fastClickMillis)
+        fastClickCount = stats.fastClickTotal
+
         val now = System.currentTimeMillis()
         if (now - windowStartMs >= 1000L) {
             if (dropped > 0) {
                 buffer.addLast(
-                    AdLogEntry(nowClock(), "AdLogStore", "+$dropped more lines suppressed (rate limit)", AdLogKind.OTHER)
+                    AdLogEntry(nowClock(now), "AdLogStore", "+$dropped more lines suppressed (rate limit)", AdLogKind.OTHER, atMillis = now)
                 )
                 dropped = 0
             }
@@ -409,10 +538,11 @@ object AdLogStore {
     /** Records a line the app raises itself, for events logcat would not carry. */
     fun post(tag: String, message: String) {
         val kind = AdLogKind.of("$tag $message")
+        val now = System.currentTimeMillis()
         record(
             AdLogEntry(
-                nowClock(), tag, message, kind,
-                AdPlacement.of(message), currentScreen, reasonFor(kind, message)
+                nowClock(now), tag, message, kind,
+                AdPlacement.of(message), currentScreen, reasonFor(kind, message), atMillis = now
             )
         )
     }
@@ -421,13 +551,15 @@ object AdLogStore {
      * Records an ad event the host hands over directly. This is the integration that does
      * not depend on the log at all - see [AdLogConfig.readLogcat].
      */
-    fun post(kind: AdLogKind, placement: String?, message: String, tag: String = "app") =
+    fun post(kind: AdLogKind, placement: String?, message: String, tag: String = "app") {
+        val now = System.currentTimeMillis()
         record(
             AdLogEntry(
-                nowClock(), tag, message, kind, placement, currentScreen,
-                reasonFor(kind, message)
+                nowClock(now), tag, message, kind, placement, currentScreen,
+                reasonFor(kind, message), atMillis = now
             )
         )
+    }
 
     private fun reasonFor(kind: AdLogKind, message: String): String? =
         if (kind == AdLogKind.FAILED || kind == AdLogKind.DENIED) AdFailureReason.of(message) else null
@@ -471,11 +603,12 @@ object AdLogStore {
             // reader being switched off on purpose, not a failure worth a red FAILED line.
             if (!cs.isActive) return
             // A device that refuses to exec logcat is not a reason to crash a debug build.
+            val now = System.currentTimeMillis()
             record(
                 AdLogEntry(
-                    nowClock(), "AdLogStore",
+                    nowClock(now), "AdLogStore",
                     "logcat reader stopped: ${e.javaClass.simpleName}: ${e.message}",
-                    AdLogKind.FAILED
+                    AdLogKind.FAILED, atMillis = now
                 )
             )
             Log.w("AdLogStore", "logcat reader stopped", e)
@@ -504,9 +637,10 @@ object AdLogStore {
             // Unexpected shape - keep it only if the raw text looks ad-related.
             if (!AD_MESSAGE_PATTERN.containsMatchIn(line)) return null
             val loose = AdLogKind.of(line)
+            val now = System.currentTimeMillis()
             return AdLogEntry(
-                nowClock(), "logcat", line.trim(), loose, null, currentScreen,
-                reasonFor(loose, line)
+                nowClock(now), "logcat", line.trim(), loose, null, currentScreen,
+                reasonFor(loose, line), atMillis = now
             )
         }
 
@@ -530,23 +664,62 @@ object AdLogStore {
         if (!relevant) return null
 
         // "09-14 11:06:42.123 D" -> keep the clock, drop the date and the level letter.
+        val now = System.currentTimeMillis()
         val head = line.substring(0, slash).trim()
-        val time = head.substringAfter(' ').substringBeforeLast(' ').ifBlank { nowClock() }
+        val time = head.substringAfter(' ').substringBeforeLast(' ').ifBlank { nowClock(now) }
+        // Durations - load time, fast clicks - use when the line was LOGGED, not when it was read:
+        // logcat hands lines over in bursts, and a burst would otherwise measure as zero.
+        val at = AdLogClock.epochMillisOf(time, now, utcOffset(now))
 
         val shown =
             if (message.length > MAX_MESSAGE_CHARS) message.take(MAX_MESSAGE_CHARS) + " …" else message
         val kind = AdLogKind.of("$tag $message")
         return AdLogEntry(
             time, tag, shown, kind,
-            AdPlacement.of(message), currentScreen, reasonFor(kind, message)
+            AdPlacement.of(message), currentScreen, reasonFor(kind, message), atMillis = at
         )
     }
 
-    private fun nowClock(): String {
-        val t = System.currentTimeMillis()
-        val s = (t / 1000) % 60
-        val m = (t / 60000) % 60
-        val h = (t / 3600000) % 24
-        return String.format("%02d:%02d:%02d", h, m, s)
+    /** Local time, like the clock logcat prints - so a MARK sits among the lines around it. */
+    private fun nowClock(now: Long): String = AdLogClock.clockOf(now, utcOffset(now))
+
+    private fun utcOffset(now: Long): Long = TimeZone.getDefault().getOffset(now).toLong()
+}
+
+/**
+ * Logcat's `HH:mm:ss.SSS` against the device clock. Pure, so the midnight arithmetic is unit tested.
+ */
+internal object AdLogClock {
+
+    private const val DAY_MS = 86_400_000L
+
+    private val CLOCK = Regex("""^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$""")
+
+    fun millisOfDay(clock: String): Long? {
+        val m = CLOCK.matchEntire(clock.trim()) ?: return null
+        val (h, min, s, ms) = m.destructured
+        val millis = if (ms.isEmpty()) 0L else ms.padEnd(3, '0').toLong()
+        return ((h.toLong() * 60 + min.toLong()) * 60 + s.toLong()) * 1000 + millis
+    }
+
+    /**
+     * The moment [clock] names: today, or yesterday when that is nearer. Logcat prints no year, and a
+     * line read just after midnight was usually logged just before it.
+     */
+    fun epochMillisOf(clock: String, nowMillis: Long, utcOffsetMillis: Long): Long {
+        val ofDay = millisOfDay(clock) ?: return nowMillis
+        var behind = Math.floorMod(nowMillis + utcOffsetMillis, DAY_MS) - ofDay
+        if (behind > DAY_MS / 2) behind -= DAY_MS
+        if (behind < -DAY_MS / 2) behind += DAY_MS
+        return nowMillis - behind
+    }
+
+    /** `HH:mm:ss.SSS` in the zone [utcOffsetMillis] describes. */
+    fun clockOf(millis: Long, utcOffsetMillis: Long): String {
+        val t = Math.floorMod(millis + utcOffsetMillis, DAY_MS)
+        return String.format(
+            Locale.US, "%02d:%02d:%02d.%03d",
+            t / 3_600_000, t / 60_000 % 60, t / 1000 % 60, t % 1000
+        )
     }
 }

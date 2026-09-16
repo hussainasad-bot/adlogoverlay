@@ -53,8 +53,11 @@ object AdLogFilter {
     }
 
     fun matches(e: AdLogEntry): Boolean {
+        // A tester's MARK is where they are in the run; hiding it behind a filter would lose the place.
+        if (e.mark != null) return true
         if (qaOnly) {
-            if (e.kind !in QA_KINDS) return false
+            // A fast click is exactly what QA mode exists to surface, whatever its kind.
+            if (e.kind !in QA_KINDS && e.fastClickMillis == null) return false
             // A QA line must name the ad slot it is about, or it is a stray SDK line that
             // merely classified as an event. Failures are the exception: "something broke"
             // is worth showing even when the slot cannot be identified.

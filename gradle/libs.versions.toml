@@ -3,6 +3,9 @@ agp = "8.13.2"
 kotlin = "2.2.21"
 coroutines = "1.11.0"
 firebaseBom = "34.19.0"
+playServicesAds = "25.4.0"
+ump = "4.0.0"
+fragment = "1.8.9"
 junit = "4.13.2"
 mavenPublish = "0.37.0"
 
@@ -10,6 +13,9 @@ mavenPublish = "0.37.0"
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 firebase-bom = { module = "com.google.firebase:firebase-bom", version.ref = "firebaseBom" }
 firebase-config = { module = "com.google.firebase:firebase-config" }
+play-services-ads-api = { module = "com.google.android.gms:play-services-ads-api", version.ref = "playServicesAds" }
+user-messaging-platform = { module = "com.google.android.ump:user-messaging-platform", version.ref = "ump" }
+androidx-fragment = { module = "androidx.fragment:fragment", version.ref = "fragment" }
 junit = { module = "junit:junit", version.ref = "junit" }
 
 [plugins]

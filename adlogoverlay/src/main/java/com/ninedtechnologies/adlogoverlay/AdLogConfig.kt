@@ -42,5 +42,11 @@ data class AdLogConfig(
      * Only the host knows what its codes mean, which is why this lives here and not in the
      * overlay. A value with no entry is shown as it is.
      */
-    val remoteConfigValueLabels: Map<String, Map<String, String>> = emptyMap()
+    val remoteConfigValueLabels: Map<String, Map<String, String>> = emptyMap(),
+
+    /**
+     * A click this soon after the ad appeared is flagged FAST CLICK - likely accidental, the kind of
+     * click AdMob treats as invalid traffic. Measured from the ad's first SHOWN or IMPRESSION line.
+     */
+    val fastClickMillis: Long = 1_000L
 )

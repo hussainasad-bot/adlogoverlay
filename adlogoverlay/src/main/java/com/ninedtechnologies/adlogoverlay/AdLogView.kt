@@ -1,18 +1,25 @@
 package com.ninedtechnologies.adlogoverlay
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.os.Build
+import android.os.SystemClock
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.text.Editable
+import android.text.Layout
 import android.text.SpannableStringBuilder
 import android.text.Spanned
+import android.text.SpannableString
 import android.text.TextWatcher
 import android.text.style.ForegroundColorSpan
 import android.text.style.LeadingMarginSpan
+import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
+import android.text.style.SuperscriptSpan
 import android.text.style.UnderlineSpan
 import android.util.TypedValue
 import android.view.Gravity
@@ -31,6 +38,7 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -54,8 +62,8 @@ import kotlin.math.hypot
  * clickable, so the panel and its inert children are left non-clickable and
  * [onInterceptTouchEvent] is never overridden - `dispatchTouchEvent` then walks past the
  * panel to the real UI behind it. The things that DO take a touch say so for themselves: the
- * header (drag), the chips, the log scroller, the search field and the filter rows - and
- * every one of the last two is GONE until asked for.
+ * header (drag), the chips, the log scroller, the search field, the filter rows and the tool
+ * rows - and every one of the last three is GONE until asked for.
  *
  * **2. It borrows the host's theme, not the host's layout.** The panel paints itself on the
  * host's `surface` token, so it is a light panel in a light app and a dark one in a dark app.
@@ -116,8 +124,11 @@ class AdLogView(context: Context) : FrameLayout(context) {
         private var searchOpen = false
         private var sheetOpen = false
 
-        /** FRC view on or off - remembered across screens, like search and the filter sheet. */
-        private var frcOpen = false
+        /** The TOOLS sheet - remembered across screens, like the filter sheet whose slot it shares. */
+        private var toolsOpen = false
+
+        /** The tab showing - remembered across screens, like search and the filter sheet. */
+        private var openTab = Tab.ADS
 
         /**
          * The last Remote Config read. Kept here so a new screen draws the config at once
@@ -140,6 +151,33 @@ class AdLogView(context: Context) : FrameLayout(context) {
          */
         private val foldedFrc = HashSet<String>()
 
+        /** STATS blocks the tester folded, by slot name. Main thread only, kept here for the same reason. */
+        private val foldedStats = HashSet<String>()
+
+        /**
+         * TOOLS > CLEAR emptied the store: every attached panel drops what it is showing. Only screens
+         * on show are attached, and any other screen re-renders from the store when it attaches.
+         */
+        private fun onStoreCleared() = attachedViews.toList().forEach { it.afterStoreCleared() }
+
+        /** A second tap within this confirms CLEAR or RESET. Both throw away something a tester may need. */
+        private const val CONFIRM_MS = 3_000L
+
+        /** STATS redraws at most this often while events arrive. */
+        private const val STATS_REFRESH_MS = 1_000L
+
+        /** STATS redraws this often when nothing arrives, so cache ages and expiry keep moving. */
+        private const val STATS_TICK_MS = 15_000L
+
+        /** The SCREEN line looks again this often while the panel is open - a dialog announces itself to nobody. */
+        private const val WHERE_POLL_MS = 1_000L
+
+        /** Width of the STATS session label column: "FAST CLICKS" plus a gap. */
+        private const val SESSION_LABEL_CHARS = 13
+
+        /** Width of the label column in the TOOLS and SCREEN rows, the same as the filter sheet's. */
+        private const val ROW_LABEL_DP = 46f
+
         /**
          * Per-value ceiling in the FRC view. A Remote Config value can be an arbitrarily large
          * JSON blob, and a TextView lays out everything it is given on the main thread.
@@ -159,13 +197,19 @@ class AdLogView(context: Context) : FrameLayout(context) {
         private const val LOG_HEIGHT_DP = 150f
 
         /**
-         * The FRC tab is READ: pretty-printed JSON needs far more lines than a log tail, so its
-         * text area takes this share of the usable screen height instead - never less than
-         * [LOG_HEIGHT_DP]. A fraction rather than a dp value so it scales with the phone; on a
-         * typical 6-inch phone it comes to roughly 300dp, about twice the log.
+         * The STATS and FRC tabs are READ: a table of ad slots or a config needs far more lines than a
+         * log tail, so their text area takes this share of the usable screen height instead - never
+         * less than [LOG_HEIGHT_DP]. A fraction rather than a dp value so it scales with the phone;
+         * on a typical 6-inch phone it comes to roughly 300dp, about twice the log.
          */
-        private const val FRC_HEIGHT_FRACTION = 0.40f
+        private const val TALL_HEIGHT_FRACTION = 0.40f
     }
+
+    /** ADS is the live log; STATS and FRC are read, and share the taller text area. */
+    private enum class Tab { ADS, STATS, FRC }
+
+    private val frcOpen: Boolean get() = openTab == Tab.FRC
+
 
     private val palette = AdLogPalette.resolve(context, AdLogOverlay.config)
 
@@ -181,18 +225,42 @@ class AdLogView(context: Context) : FrameLayout(context) {
     private lateinit var qaChip: TextView
     private lateinit var findChip: TextView
 
-    /**
-     * The ADS | FRC tabs. Both null when the host has no Firebase Remote Config: then there is
-     * only one view, and the header keeps its plain "ADS" title.
-     */
-    private var adsTab: TextView? = null
+    /** The ADS | STATS | FRC tabs. FRC is null when the host has no Firebase Remote Config. */
+    private lateinit var adsTab: TextView
+    private lateinit var statsTab: TextView
     private var frcTab: TextView? = null
+
+    /** The fast-click count the STATS tab's dot was last drawn for; -1 before the first draw. */
+    private var dotDrawnFor = -1
 
     /** FRC tab only: pulls the latest config from the Firebase server. Null without Firebase. */
     private var fetchChip: TextView? = null
 
-    /** Owns the off-main-thread Remote Config read; cancelled when this view detaches. */
-    private var frcScope: CoroutineScope? = null
+    /**
+     * Owns off-main-thread work - Remote Config and consent reads, building a SHARE report.
+     * Cancelled when this view detaches.
+     */
+    private var ioScope: CoroutineScope? = null
+
+    private lateinit var toolsChip: TextView
+    private lateinit var toolsSheet: LinearLayout
+    private lateinit var clearChip: TextView
+    /** Null when the host has no consent SDK. */
+    private var resetChip: TextView? = null
+    private var consentText: TextView? = null
+    private lateinit var whereText: TextView
+
+    /** True between a first tap on CLEAR or RESET and the second tap that confirms it. */
+    private var clearArmed = false
+    private var resetArmed = false
+    private val disarm = Runnable {
+        clearArmed = false
+        resetArmed = false
+        styleToolChips()
+    }
+
+    /** Uptime of the last STATS draw, for [STATS_REFRESH_MS]. */
+    private var statsDrawnAt = 0L
     private lateinit var filterChip: TextView
     private lateinit var summaryRow: LinearLayout
     private lateinit var summaryText: TextView
@@ -246,15 +314,41 @@ class AdLogView(context: Context) : FrameLayout(context) {
             flushScheduled = false
             if (pending.isEmpty()) return@Runnable
             // Collapsed means nothing is on screen: drop the batch instead of formatting it.
-            // The FRC view owns the text while it is open, so log lines must not be appended
-            // into the middle of the config. Nothing is lost either way - AdLogStore keeps the
+            // STATS and FRC own the text while they are open, so log lines must not be appended
+            // into the middle of them. Nothing is lost either way - AdLogStore keeps the
             // history, and renderAll() draws its tail when the log view comes back.
-            if (collapsed || frcOpen) { pending.clear(); return@Runnable }
-            val batch = ArrayList(pending)
-            pending.clear()
-            renderBatch(batch)
+            if (collapsed || openTab != Tab.ADS) {
+                pending.clear()
+            } else {
+                val batch = ArrayList(pending)
+                pending.clear()
+                renderBatch(batch)
+            }
         }
+        updateStatsDot()
+        if (openTab == Tab.STATS && !collapsed) requestStatsRender()
         if (sheetOpen && builtFacetVersion != AdLogStore.facetVersion) rebuildFacets()
+    }
+
+    private val statsRender = Runnable {
+        if (openTab == Tab.STATS && !collapsed) renderStats(resetScroll = false)
+    }
+
+    /** Keeps ages and expiry moving on STATS when no event arrives to redraw it. */
+    private val statsTicker = object : Runnable {
+        override fun run() {
+            if (openTab != Tab.STATS || collapsed || !isAttachedToWindow) return
+            renderStats(resetScroll = false)
+            postDelayed(this, STATS_TICK_MS)
+        }
+    }
+
+    private val whereTicker = object : Runnable {
+        override fun run() {
+            if (collapsed || !isAttachedToWindow) return
+            updateWhere()
+            postDelayed(this, WHERE_POLL_MS)
+        }
     }
 
     private val reRender = Runnable {
@@ -307,6 +401,7 @@ class AdLogView(context: Context) : FrameLayout(context) {
         panel.addView(buildSummaryRow())
         panel.addView(buildSearchRow())
         panel.addView(buildFilterSheet())
+        panel.addView(buildToolsSheet())
 
         logText = TextView(context).apply {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
@@ -337,6 +432,7 @@ class AdLogView(context: Context) : FrameLayout(context) {
             scroller,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(LOG_HEIGHT_DP).toInt())
         )
+        panel.addView(buildWhereRow())
 
         addView(
             panel,
@@ -381,54 +477,68 @@ class AdLogView(context: Context) : FrameLayout(context) {
             isClickable = true
             setOnTouchListener(DragPanelVertically())
         }
-        // Only a host that ships Firebase Remote Config gets tabs. For any other host a second
-        // tab could only ever say "not available", so the header stays exactly as it was.
+        adsTab = tab("ADS") { setTab(Tab.ADS) }.also {
+            it.contentDescription = "Show the ad log"
+            row.addView(it)
+        }
+        statsTab = tab("STATS") { setTab(Tab.STATS) }.also {
+            it.contentDescription = "Show ad stats for each slot"
+            row.addView(it)
+        }
+        // Only a host that ships Firebase Remote Config gets an FRC tab. For any other host it
+        // could only ever say "not available".
         if (AdLogRemoteConfig.isOnClasspath) {
-            adsTab = tab("ADS") { setFrcOpen(false) }.also {
-                it.contentDescription = "Show the ad log"
-                row.addView(it)
-            }
-            frcTab = tab("FRC") { setFrcOpen(true) }.also {
+            frcTab = tab("FRC") { setTab(Tab.FRC) }.also {
                 it.contentDescription = "Show this app's Firebase Remote Config"
                 row.addView(it)
             }
         }
         row.addView(
             TextView(context).apply {
-                // The dots read as a grab handle. Tabs take their own taps, so the drag lives in
-                // the space after them - which is why this, not the tabs, carries the weight.
-                text = if (adsTab == null) "ADS  ⠿" else "  ⠿"
+                // The dots read as a grab handle.
+                text = "  ⠿"
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
                 typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-                setTextColor(if (adsTab == null) palette.heading else palette.subtext)
+                setTextColor(palette.subtext)
                 isClickable = false
-            },
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { weight = 1f; width = 0 }
+            }
         )
 
-        if (adsTab != null) {
+        // The chips take the flexible middle, right-aligned. Not clickable itself, so the free space
+        // to their left still drags the panel; and on a narrow screen or a large font it is the
+        // chips that run out of room, never the ✕ that closes the panel.
+        val chips = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            isClickable = false
+        }
+        row.addView(chips, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        if (frcTab != null) {
             fetchChip = chip("REFRESH") { startFetch() }.also {
                 it.contentDescription = "Download the latest Remote Config from Firebase"
-                row.addView(it, chipParams())
+                chips.addView(it, chipParams())
             }
         }
 
         findChip = chip("FIND") { setSearchOpen(!searchOpen) }
         findChip.contentDescription = "Search the ad log"
-        row.addView(findChip, chipParams())
+        chips.addView(findChip, chipParams())
 
         filterChip = chip("FILTER") { setSheetOpen(!sheetOpen) }
         filterChip.contentDescription = "Filter ad events"
-        row.addView(filterChip, chipParams())
+        chips.addView(filterChip, chipParams())
 
         qaChip = chip("QA") {
             AdLogFilter.qaOnly = !AdLogFilter.qaOnly
             reRender.run()
         }
         qaChip.contentDescription = "Show only ad events, in plain language"
-        row.addView(qaChip, chipParams())
+        chips.addView(qaChip, chipParams())
+
+        toolsChip = chip("TOOLS") { setToolsOpen(!toolsOpen) }
+        toolsChip.contentDescription = "Mark, clear or share the log, open Ad Inspector, check consent"
+        chips.addView(toolsChip, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         row.addView(
             TextView(context).apply {
@@ -559,6 +669,108 @@ class AdLogView(context: Context) : FrameLayout(context) {
         return filterSheet
     }
 
+    /**
+     * TOOLS, in the filter sheet's slot and style - one row per job, a label column then chips:
+     *
+     *     LOG      MARK  CLEAR  SHARE
+     *     SDK      AD INSPECTOR                      (only when the host has Google Mobile Ads)
+     *     CONSENT  obtained · can request ads · GDPR applies   RESET   (only with UMP)
+     */
+    private fun buildToolsSheet(): View {
+        val (logRow, logChips) = facetRow("LOG")
+        logChips.addView(
+            chip("MARK") { addMark() }.apply { contentDescription = "Add a numbered divider to the log" },
+            chipParams()
+        )
+        clearChip = chip("CLEAR") { onClearTapped() }.apply {
+            contentDescription = "Clear the log and stats - tap twice"
+        }
+        logChips.addView(clearChip, chipParams())
+        logChips.addView(
+            chip("SHARE") { shareReport() }.apply { contentDescription = "Share the log, stats and Remote Config" },
+            chipParams()
+        )
+
+        toolsSheet = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            isClickable = false
+            setPadding(0, dp(3f).toInt(), 0, dp(4f).toInt())
+            // A hairline under the sheet: its chips act on things, where the log below only reads.
+            background = LayerDrawable(arrayOf(GradientDrawable().apply { setColor(palette.border) })).apply {
+                setLayerGravity(0, Gravity.BOTTOM or Gravity.FILL_HORIZONTAL)
+                setLayerHeight(0, dp(1f).toInt().coerceAtLeast(1))
+            }
+            addView(logRow)
+            visibility = GONE
+        }
+
+        if (AdLogSdk.hasMobileAds) {
+            val (sdkRow, sdkChips) = facetRow("SDK")
+            sdkChips.addView(
+                chip("AD INSPECTOR") { openAdInspector() }.apply {
+                    contentDescription = "Open Google's Ad Inspector"
+                },
+                chipParams()
+            )
+            toolsSheet.addView(sdkRow)
+        }
+
+        if (AdLogSdk.hasConsent) {
+            val text = TextView(context).apply {
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
+                typeface = Typeface.MONOSPACE
+                setTextColor(palette.subtext)
+                text = "reading…"
+                isClickable = false
+            }
+            consentText = text
+            val reset = chip("RESET") { onResetTapped() }.apply {
+                contentDescription = "Reset consent so the form shows again - tap twice"
+            }
+            resetChip = reset
+            toolsSheet.addView(
+                LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    isClickable = false
+                    setPadding(0, dp(2f).toInt(), 0, dp(2f).toInt())
+                    addView(rowLabel("CONSENT"), LinearLayout.LayoutParams(dp(ROW_LABEL_DP).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT))
+                    addView(text, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    addView(reset)
+                }
+            )
+        }
+        styleToolChips()
+        return toolsSheet
+    }
+
+    /** Where the tester is, under everything else - see [AdLogWhere]. */
+    private fun buildWhereRow(): View {
+        whereText = TextView(context).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 8f)
+            typeface = Typeface.MONOSPACE
+            setTextColor(palette.heading)
+            maxLines = 2
+            isClickable = false
+        }
+        return LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = false
+            setPadding(0, dp(4f).toInt(), 0, 0)
+            addView(rowLabel("SCREEN"), LinearLayout.LayoutParams(dp(ROW_LABEL_DP).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(whereText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+    }
+
+    private fun rowLabel(title: String): TextView = TextView(context).apply {
+        text = title
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 8f)
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        setTextColor(palette.subtext)
+        isClickable = false
+    }
+
     private fun facetRow(title: String): Pair<View, LinearLayout> {
         val chips = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
         val row = LinearLayout(context).apply {
@@ -566,16 +778,7 @@ class AdLogView(context: Context) : FrameLayout(context) {
             gravity = Gravity.CENTER_VERTICAL
             isClickable = false
             setPadding(0, dp(2f).toInt(), 0, dp(2f).toInt())
-            addView(
-                TextView(context).apply {
-                    text = title
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 8f)
-                    typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-                    setTextColor(palette.subtext)
-                    isClickable = false
-                },
-                LinearLayout.LayoutParams(dp(46f).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
-            )
+            addView(rowLabel(title), LinearLayout.LayoutParams(dp(ROW_LABEL_DP).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT))
             addView(
                 HorizontalScrollView(context).apply {
                     isHorizontalScrollBarEnabled = false
@@ -620,6 +823,8 @@ class AdLogView(context: Context) : FrameLayout(context) {
 
     private fun chip(label: String, onClick: () -> Unit): TextView = TextView(context).apply {
         text = label
+        // One line: squeezed for room, a chip is cut short rather than doubling the header's height.
+        maxLines = 1
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
         typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
         setPadding(dp(7f).toInt(), dp(2f).toInt(), dp(7f).toInt(), dp(2f).toInt())
@@ -686,7 +891,10 @@ class AdLogView(context: Context) : FrameLayout(context) {
         val facetsOn = AdLogFilter.kinds.isNotEmpty() || AdLogFilter.screens.isNotEmpty() ||
             AdLogFilter.placements.isNotEmpty() || AdLogFilter.reasons.isNotEmpty()
         styleChip(filterChip, sheetOpen || facetsOn, palette.colorOf(AdLogKind.SHOWN))
-        adsTab?.let { styleTab(it, !frcOpen) }
+        // Indigo, the colour of SDK lines: TOOLS acts on the SDK and the session, not on the view.
+        styleChip(toolsChip, toolsOpen, palette.colorOf(AdLogKind.INIT))
+        styleTab(adsTab, openTab == Tab.ADS)
+        styleTab(statsTab, openTab == Tab.STATS)
         frcTab?.let { styleTab(it, frcOpen) }
         fetchChip?.let {
             it.visibility = if (frcOpen) VISIBLE else GONE
@@ -696,13 +904,18 @@ class AdLogView(context: Context) : FrameLayout(context) {
         }
 
         // QA, the facet sheet and the facet summary only mean something against the ad log.
-        // On the FRC tab they step aside rather than sitting there doing nothing when tapped.
-        // FIND stays: it searches the config too.
-        qaChip.visibility = if (frcOpen) GONE else VISIBLE
-        filterChip.visibility = if (frcOpen) GONE else VISIBLE
-        filterSheet.visibility = if (sheetOpen && !frcOpen) VISIBLE else GONE
+        // On STATS and FRC they step aside rather than sitting there doing nothing when tapped.
+        // FIND stays on FRC, where it searches the config; STATS is a table with nothing to find.
+        // TOOLS is on every tab.
+        val onLog = openTab == Tab.ADS
+        qaChip.visibility = if (onLog) VISIBLE else GONE
+        filterChip.visibility = if (onLog) VISIBLE else GONE
+        findChip.visibility = if (openTab == Tab.STATS) GONE else VISIBLE
+        searchRow.visibility = if (searchOpen && openTab != Tab.STATS) VISIBLE else GONE
+        filterSheet.visibility = if (sheetOpen && onLog) VISIBLE else GONE
+        toolsSheet.visibility = if (toolsOpen) VISIBLE else GONE
 
-        if (AdLogFilter.isActive && !frcOpen) {
+        if (AdLogFilter.isActive && onLog) {
             summaryText.text = AdLogFilter.summary()
             summaryRow.visibility = VISIBLE
         } else {
@@ -710,20 +923,21 @@ class AdLogView(context: Context) : FrameLayout(context) {
         }
     }
 
-    private fun setFrcOpen(open: Boolean) {
-        if (frcOpen == open) {
+    private fun setTab(tab: Tab) {
+        if (openTab == tab) {
             // Tapping the tab already showing. On FRC that means "read it again now" - the
-            // obvious gesture after the app has fetched. On ADS there is nothing to redo.
-            if (open) loadRemoteConfig()
+            // obvious gesture after the app has fetched. Elsewhere there is nothing to redo.
+            if (tab == Tab.FRC) loadRemoteConfig()
             return
         }
-        frcOpen = open
+        openTab = tab
         applyContentHeight()
         removeCallbacks(reRender)
-        if (open) loadRemoteConfig()
-        // Draws the config, or - on the way out - the log tail the FRC view was hiding.
+        if (tab == Tab.FRC) loadRemoteConfig()
+        // Draws the stats or the config, or - back on ADS - the log tail they were hiding.
         renderAll()
         styleFilterChrome()
+        updateStatsTicker()
     }
 
     private fun setSearchOpen(open: Boolean) {
@@ -743,10 +957,200 @@ class AdLogView(context: Context) : FrameLayout(context) {
 
     private fun setSheetOpen(open: Boolean) {
         sheetOpen = open
-        filterSheet.visibility = if (open) VISIBLE else GONE
+        // FILTER and TOOLS share one slot under the header: opening one closes the other.
+        if (open) toolsOpen = false
         if (open) rebuildFacets()
         styleFilterChrome()
     }
+
+    private fun setToolsOpen(open: Boolean) {
+        toolsOpen = open
+        if (open) {
+            sheetOpen = false
+            refreshConsent()
+        }
+        styleFilterChrome()
+    }
+
+    // ---------------------------------------------------------------- tools
+
+    private fun addMark() {
+        val n = AdLogStore.mark()
+        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        // On the log the divider itself is the confirmation; elsewhere it would land unseen.
+        if (openTab != Tab.ADS) toast("Mark $n added to the log")
+    }
+
+    private fun onClearTapped() {
+        if (!clearArmed) {
+            clearArmed = true
+            resetArmed = false
+            styleToolChips()
+            removeCallbacks(disarm)
+            postDelayed(disarm, CONFIRM_MS)
+            return
+        }
+        removeCallbacks(disarm)
+        clearArmed = false
+        AdLogStore.clear()
+        onStoreCleared()
+        styleToolChips()
+        toast("Log and stats cleared")
+    }
+
+    private fun onResetTapped() {
+        if (!resetArmed) {
+            resetArmed = true
+            clearArmed = false
+            styleToolChips()
+            removeCallbacks(disarm)
+            postDelayed(disarm, CONFIRM_MS)
+            return
+        }
+        removeCallbacks(disarm)
+        resetArmed = false
+        styleToolChips()
+        val error = AdLogSdk.resetConsent(context)
+        toast(error ?: "Consent reset - close and reopen the app to see the consent form again", long = true)
+        refreshConsent()
+    }
+
+    /** A chip waiting for its confirming tap turns red and asks. */
+    private fun styleToolChips() {
+        val red = palette.colorOf(AdLogKind.FAILED)
+        clearChip.text = if (clearArmed) "CLEAR?" else "CLEAR"
+        styleChip(clearChip, clearArmed, red)
+        resetChip?.let {
+            it.text = if (resetArmed) "RESET?" else "RESET"
+            styleChip(it, resetArmed, red)
+        }
+    }
+
+    private fun afterStoreCleared() {
+        synchronized(pending) { pending.clear() }
+        dotDrawnFor = -1
+        updateStatsDot()
+        if (sheetOpen) rebuildFacets()
+        renderAll()
+    }
+
+    private fun openAdInspector() {
+        AdLogSdk.openAdInspector(context) { error -> error?.let { toast(it, long = true) } }
+    }
+
+    private fun refreshConsent() {
+        val text = consentText ?: return
+        val appContext = context.applicationContext
+        scope().launch {
+            val consent = AdLogSdk.consent(appContext)
+            ensureActive()
+            this@AdLogView.post {
+                val sb = SpannableStringBuilder()
+                if (consent == null) sb.appendStyled("not available", palette.subtext)
+                else appendSpans(sb, AdLogSdk.consentSpans(consent))
+                text.text = sb
+            }
+        }
+    }
+
+    /**
+     * SHARE: the whole log, the stats, Remote Config and the device, as text for Android's share
+     * sheet - see [AdLogReport]. Built off the main thread; the screen is read here first, because
+     * only the main thread may look at views.
+     */
+    private fun shareReport() {
+        val activity = context
+        val where = (activity as? Activity)?.let { AdLogWhere.of(it) }
+        val appContext = context.applicationContext
+        scope().launch {
+            val now = System.currentTimeMillis()
+            val header = reportHeader(appContext, now, where)
+            val text = AdLogReport.build(
+                header,
+                AdLogStore.stats(),
+                AdLogStore.snapshot(),
+                if (AdLogRemoteConfig.isOnClasspath) AdLogRemoteConfig.read() else null,
+                now
+            )
+            ensureActive()
+            this@AdLogView.post {
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "Ad log - ${header.first().second}")
+                    putExtra(Intent.EXTRA_TEXT, text)
+                }
+                val chooser = Intent.createChooser(send, "Share ad log")
+                if (activity !is Activity) chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                try {
+                    activity.startActivity(chooser)
+                } catch (e: Exception) {
+                    toast("Can't share the log - ${e.javaClass.simpleName}: ${e.message.orEmpty()}", long = true)
+                }
+            }
+        }
+    }
+
+    private fun reportHeader(app: Context, now: Long, where: String?): List<Pair<String, String>> {
+        val header = ArrayList<Pair<String, String>>(6)
+        val pm = app.packageManager
+        val label = runCatching { app.applicationInfo.loadLabel(pm).toString() }.getOrDefault(app.packageName)
+        val version = runCatching {
+            @Suppress("DEPRECATION")
+            val info = pm.getPackageInfo(app.packageName, 0)
+            val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) info.longVersionCode else {
+                @Suppress("DEPRECATION")
+                info.versionCode.toLong()
+            }
+            "${info.versionName} ($code)"
+        }.getOrDefault("")
+        header += "App" to listOf("$label $version".trim(), app.packageName).joinToString("  ·  ")
+        header += "Device" to "${Build.MANUFACTURER} ${Build.MODEL}  ·  Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
+        header += "Time" to SimpleDateFormat("yyyy-MM-dd HH:mm:ss ZZZZZ", Locale.US).format(Date(now))
+        where?.let { header += "Screen" to it }
+        AdLogSdk.consent(app)?.let { c -> header += "Consent" to AdLogSdk.consentSpans(c).joinToString("") { it.text } }
+        return header
+    }
+
+    private fun updateWhere() {
+        val activity = context as? Activity ?: return
+        val where = AdLogWhere.of(activity)
+        if (whereText.text.toString() != where) whereText.text = where
+    }
+
+    private fun updateWhereTicker() {
+        removeCallbacks(whereTicker)
+        if (!collapsed && isAttachedToWindow) whereTicker.run()
+    }
+
+    /** A red dot on STATS while fast clicks exist - the one thing on that tab worth pulling a tester over for. */
+    private fun updateStatsDot() {
+        val n = AdLogStore.fastClickCount
+        if (n == dotDrawnFor) return
+        dotDrawnFor = n
+        if (n == 0) {
+            statsTab.text = "STATS"
+            statsTab.contentDescription = "Show ad stats for each slot"
+            return
+        }
+        statsTab.text = SpannableString("STATS●").apply {
+            val dot = length - 1
+            setSpan(ForegroundColorSpan(palette.colorOf(AdLogKind.FAILED)), dot, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(RelativeSizeSpan(0.6f), dot, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(SuperscriptSpan(), dot, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        statsTab.contentDescription = "Show ad stats for each slot - $n fast click${if (n == 1) "" else "s"}"
+    }
+
+    private fun updateStatsTicker() {
+        removeCallbacks(statsTicker)
+        if (openTab == Tab.STATS && !collapsed && isAttachedToWindow) postDelayed(statsTicker, STATS_TICK_MS)
+    }
+
+    private fun toast(text: String, long: Boolean = false) =
+        Toast.makeText(context, text, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+
+    private fun scope(): CoroutineScope =
+        ioScope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO).also { ioScope = it }
 
     private fun ime(): InputMethodManager? =
         context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
@@ -1065,7 +1469,7 @@ class AdLogView(context: Context) : FrameLayout(context) {
         // the panel below its own bottom edge, a taller one never can.
         panelY = panelY.coerceAtMost(panelMaxY())
         if (!collapsed) panel.translationY = panelY
-        // The FRC height is a share of the screen, so it has to be recomputed whenever the
+        // The STATS and FRC height is a share of the screen, so it has to be recomputed whenever the
         // screen size is known or changes. Posted: resizing a child from inside this view's own
         // layout pass would force a second pass.
         post { applyContentHeight() }
@@ -1074,11 +1478,11 @@ class AdLogView(context: Context) : FrameLayout(context) {
     /** Set when the text area has just been resized; consumed by the next [onLayout]. */
     private var clampAfterResize = false
 
-    /** Sizes the text area for the tab that is showing - see [FRC_HEIGHT_FRACTION]. */
+    /** Sizes the text area for the tab that is showing - see [TALL_HEIGHT_FRACTION]. */
     private fun applyContentHeight() {
         val usable = height - insetTop - insetBottom
-        val target = if (frcOpen && usable > 0) {
-            maxOf(dp(LOG_HEIGHT_DP), usable * FRC_HEIGHT_FRACTION).toInt()
+        val target = if (openTab != Tab.ADS && usable > 0) {
+            maxOf(dp(LOG_HEIGHT_DP), usable * TALL_HEIGHT_FRACTION).toInt()
         } else {
             dp(LOG_HEIGHT_DP).toInt()
         }
@@ -1124,10 +1528,13 @@ class AdLogView(context: Context) : FrameLayout(context) {
             // what is on screen is stale the moment the panel reopens.
             renderAll()
             if (sheetOpen) rebuildFacets()
+            if (toolsOpen) refreshConsent()
             // Reopening is the natural "show me it now" - the host may have fetched and
             // activated since the config was last read.
             if (frcOpen) loadRemoteConfig()
         }
+        updateStatsTicker()
+        updateWhereTicker()
     }
 
     private fun applyMode() {
@@ -1138,9 +1545,9 @@ class AdLogView(context: Context) : FrameLayout(context) {
         } else {
             // Re-apply where the panel was dragged to on the previous screen.
             panel.translationY = panelY
-            // Reopening straight onto the taller FRC tab can overhang the bottom edge; check once
-            // it has laid out. Only on FRC - the ADS tab keeps exactly the drag position it had.
-            if (frcOpen) clampAfterResize = true
+            // Reopening straight onto a taller tab can overhang the bottom edge; check once it has
+            // laid out. Only on STATS and FRC - the ADS tab keeps exactly the drag position it had.
+            if (openTab != Tab.ADS) clampAfterResize = true
         }
     }
 
@@ -1149,9 +1556,10 @@ class AdLogView(context: Context) : FrameLayout(context) {
     private fun renderAll() {
         // One entry point for both views, so the search debounce and every other caller of
         // reRender redraw whichever view is showing without knowing which one it is.
-        if (frcOpen) {
-            renderRemoteConfig(resetScroll = true)
-            return
+        when (openTab) {
+            Tab.FRC -> return renderRemoteConfig(resetScroll = true)
+            Tab.STATS -> return renderStats(resetScroll = true)
+            Tab.ADS -> Unit
         }
         logText.setText("", TextView.BufferType.EDITABLE)
         lineCount = 0
@@ -1169,13 +1577,16 @@ class AdLogView(context: Context) : FrameLayout(context) {
 
     /** Formats one entry into its own small spannable - never touches the existing text. */
     private fun format(e: AdLogEntry): SpannableStringBuilder {
+        e.mark?.let { return formatMark(e, it) }
         val sb = SpannableStringBuilder()
         val qa = AdLogFilter.qaOnly
-        val kindColor = palette.colorOf(e.kind)
+        // A fast click is drawn as a failure: it is the line a tester has to act on.
+        val fast = e.fastClickMillis != null
+        val kindColor = palette.colorOf(if (fast) AdLogKind.FAILED else e.kind)
         // QA mode drops the milliseconds: "11:54:31" is what a tester reads off a stopwatch,
         // "11:54:31.487" is what a developer reads off a trace.
         val clock = if (qa) e.time.substringBefore('.') else e.time
-        sb.append(clock).append("  ").append(e.kind.label).append("  ")
+        sb.append(clock).append("  ").append(if (fast) "FAST CLICK" else e.kind.label).append("  ")
         sb.setSpan(ForegroundColorSpan(kindColor), 0, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         sb.setSpan(StyleSpan(Typeface.BOLD), 0, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
 
@@ -1197,11 +1608,14 @@ class AdLogView(context: Context) : FrameLayout(context) {
 
         // A failure is only useful with its reason, so failures and refusals are printed at
         // full brightness instead of the dimmed body colour everything else gets.
-        val isFailure = e.kind == AdLogKind.FAILED || e.kind == AdLogKind.DENIED
+        val isFailure = fast || e.kind == AdLogKind.FAILED || e.kind == AdLogKind.DENIED
         sb.setSpan(
             ForegroundColorSpan(if (isFailure) kindColor else palette.dim(kindColor)),
             body, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
         )
+
+        // How long the load took, bright: the number a tester compares between runs.
+        e.loadMillis?.let { sb.appendStyled("  in ${AdLogStatsText.loadTime(it)}", palette.heading, bold = true) }
 
         // WHERE it happened, appended AFTER the body span so it keeps its own dimmer colour
         // instead of being repainted by a span that would otherwise cover it.
@@ -1209,6 +1623,13 @@ class AdLogView(context: Context) : FrameLayout(context) {
             val at = sb.length
             sb.append("  @").append(it)
             sb.setSpan(ForegroundColorSpan(palette.subtext), at, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+
+        e.fastClickMillis?.let {
+            val why = sb.length
+            sb.append("\n              ↳ ").append(AdLogReport.fastClickReason(it))
+            sb.setSpan(ForegroundColorSpan(kindColor), why, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.setSpan(StyleSpan(Typeface.BOLD), why, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
 
         if (isFailure) {
@@ -1228,6 +1649,31 @@ class AdLogView(context: Context) : FrameLayout(context) {
         sb.append("\n")
         return sb
     }
+
+    /** `── MARK 2 ──────────── 11:54:36`, across the width of the log. */
+    private fun formatMark(e: AdLogEntry, n: Int): SpannableStringBuilder {
+        val sb = SpannableStringBuilder()
+        sb.appendStyled("── MARK $n ", palette.heading, bold = true)
+        val right = " ${e.time.substringBefore('.')}"
+        // Measured, not counted: the monospace font has no box-drawing glyphs, and the fallback's
+        // dash is wider than a column - counting columns ran the time onto a second line.
+        val dash = SpannableStringBuilder().apply { appendStyled("─", palette.heading, bold = true) }
+        val room = textWidth() - widthOf(sb) - logText.paint.measureText(right) - logText.paint.measureText("00")
+        val dashes = (room / widthOf(dash)).toInt().coerceIn(3, 200)
+        sb.appendStyled("─".repeat(dashes), palette.heading, bold = true)
+        sb.appendStyled(right, palette.subtext)
+        sb.append("\n")
+        return sb
+    }
+
+    /** Pixels the text area is wide - before the first layout, what the panel's margins leave of the screen. */
+    private fun textWidth(): Float =
+        if (logText.width > 0) (logText.width - logText.totalPaddingLeft - logText.totalPaddingRight).toFloat()
+        else resources.displayMetrics.widthPixels - dp(32f)
+
+    /** Drawn width of styled text, fallback glyphs and bold included. */
+    private fun widthOf(text: CharSequence, start: Int = 0, end: Int = text.length): Float =
+        Layout.getDesiredWidth(text, start, end, logText.paint)
 
     private fun underlineMatches(sb: SpannableStringBuilder, query: String) {
         val hay = sb.toString().lowercase()
@@ -1298,8 +1744,7 @@ class AdLogView(context: Context) : FrameLayout(context) {
      * coroutines-core alone, and Main needs coroutines-android, which a host may not ship.
      */
     private fun loadRemoteConfig() {
-        val scope = frcScope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO).also { frcScope = it }
-        scope.launch {
+        scope().launch {
             val snapshot = AdLogRemoteConfig.read()
             // read() is blocking and cannot be interrupted; if this view detached while it ran,
             // stop here rather than posting to a view nobody will attach again.
@@ -1342,7 +1787,7 @@ class AdLogView(context: Context) : FrameLayout(context) {
     private var foldTargets: List<FoldTarget> = emptyList()
 
     /**
-     * FRC tab: a tap on a ▾ / ▸ line folds or unfolds that group. Only a tap - a drag still scrolls,
+     * STATS and FRC: a tap on a ▾ / ▸ line folds or unfolds that group. Only a tap - a drag still scrolls,
      * because the ScrollView takes the gesture over, and cancels it here, once it moves.
      */
     private inner class TapToFold : OnTouchListener {
@@ -1353,7 +1798,7 @@ class AdLogView(context: Context) : FrameLayout(context) {
         @SuppressLint("ClickableViewAccessibility")
         override fun onTouch(v: View, e: MotionEvent): Boolean {
             // The ADS tab keeps its text inert, exactly as before.
-            if (!frcOpen || foldTargets.isEmpty()) return false
+            if (openTab == Tab.ADS || foldTargets.isEmpty()) return false
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = e.x
@@ -1373,10 +1818,111 @@ class AdLogView(context: Context) : FrameLayout(context) {
     }
 
     private fun toggleFold(key: String) {
-        if (!foldedFrc.remove(key)) foldedFrc.add(key)
+        val folded = if (openTab == Tab.STATS) foldedStats else foldedFrc
+        if (!folded.remove(key)) folded.add(key)
         logText.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
         // Keep the scroll position: the tapped line stays under the finger.
-        renderRemoteConfig(resetScroll = false)
+        if (openTab == Tab.STATS) renderStats(resetScroll = false) else renderRemoteConfig(resetScroll = false)
+    }
+
+    // ------------------------------------------------------------------- stats
+
+    private fun requestStatsRender() {
+        removeCallbacks(statsRender)
+        val wait = STATS_REFRESH_MS - (SystemClock.uptimeMillis() - statsDrawnAt)
+        if (wait <= 0) statsRender.run() else postDelayed(statsRender, wait)
+    }
+
+    private fun renderStats(resetScroll: Boolean) {
+        statsDrawnAt = SystemClock.uptimeMillis()
+        val keepY = scroller.scrollY
+        lineCount = 0
+        val targets = ArrayList<FoldTarget>()
+        logText.text = formatStats(AdLogStore.stats(), System.currentTimeMillis(), targets)
+        foldTargets = targets
+        scroller.post { scroller.scrollTo(0, if (resetScroll) 0 else keepY) }
+    }
+
+    /**
+     * The session in three rows, then one foldable block per ad slot, problems first:
+     *
+     *     SESSION      14 min  ·  22 requested  ·  13 loaded  ·  9 shown
+     *     FAST CLICKS  2  ·  Intent_Open_INTER_AD
+     *     CACHED NOW   4 ads  ·  1 expiring soon
+     *
+     *     ▾ Home_NATIVE_AD  native               ● cached 52m · expires in 8m
+     *       requested 6  ·  loaded 5  ·  shown 4
+     *       fill 83%  ·  shown 80%  ·  loads in 1.2s
+     *
+     * The words come from [AdLogStatsText], shared with SHARE.
+     */
+    private fun formatStats(stats: AdStatsSnapshot, now: Long, foldTargets: MutableList<FoldTarget>): SpannableStringBuilder {
+        val sb = SpannableStringBuilder()
+        val charWidth = logText.paint.measureText("0")
+        for ((label, spans) in AdLogStatsText.sessionRows(stats, now)) {
+            val start = sb.length
+            sb.appendStyled(label.padEnd(SESSION_LABEL_CHARS), palette.subtext)
+            appendSpans(sb, spans)
+            sb.append("\n")
+            hang(sb, start, SESSION_LABEL_CHARS, charWidth)
+        }
+
+        val slots = stats.ordered(now)
+        if (slots.isEmpty()) {
+            sb.appendStyled(
+                "\nNo ad events yet. Counts fill in as the app requests and shows ads - from every line " +
+                    "that names an ad slot.\n",
+                palette.subtext
+            )
+            return sb
+        }
+
+        val width = textWidth()
+        val spaceWidth = logText.paint.measureText(" ")
+        for (slot in slots) {
+            val lines = AdLogStatsText.lines(slot, now)
+            val folded = slot.placement in foldedStats
+            sb.append("\n")
+            val start = sb.length
+            sb.appendStyled(if (folded) "▸ " else "▾ ", palette.heading, bold = true)
+            sb.appendStyled(slot.placement, palette.heading, bold = true)
+            slot.format?.let { sb.appendStyled("  $it", palette.subtext) }
+            if (folded) sb.appendStyled("  ·  ${lines.size} hidden", palette.subtext)
+            val badge = AdLogStatsText.badge(slot, now)
+            if (badge.isNotEmpty()) {
+                // Right-aligned by padding with spaces, measured in pixels: the arrow and the dot come
+                // from a fallback font and are not one column wide. One space spare; no room at all
+                // puts the badge on a line of its own.
+                val badgeText = SpannableStringBuilder().also { appendSpans(it, badge) }
+                val gap = ((width - widthOf(sb, start, sb.length) - widthOf(badgeText)) / spaceWidth).toInt() - 1
+                sb.append(if (gap >= 2) " ".repeat(gap) else "\n    ")
+                sb.append(badgeText)
+            }
+            sb.append("\n")
+            foldTargets += FoldTarget(start, sb.length, slot.placement)
+            if (folded) continue
+            for (line in lines) {
+                val lineStart = sb.length
+                sb.append("  ")
+                appendSpans(sb, line)
+                sb.append("\n")
+                hang(sb, lineStart, 2, charWidth)
+            }
+        }
+        return sb
+    }
+
+    private fun appendSpans(sb: SpannableStringBuilder, spans: List<AdLogSpan>) {
+        for (span in spans) {
+            val color = when (span.tone) {
+                AdLogTone.NORMAL, AdLogTone.TITLE -> palette.heading
+                AdLogTone.MUTED -> palette.subtext
+                AdLogTone.GOOD -> palette.colorOf(AdLogKind.LOADED)
+                AdLogTone.WARN -> palette.colorOf(AdLogKind.EXPIRED)
+                AdLogTone.BAD -> palette.colorOf(AdLogKind.FAILED)
+            }
+            sb.appendStyled(span.text, color, bold = span.bold || span.tone == AdLogTone.TITLE)
+        }
     }
 
     private fun renderRemoteConfig(resetScroll: Boolean) {
@@ -1722,15 +2268,17 @@ class AdLogView(context: Context) : FrameLayout(context) {
             searchInput.setText(AdLogFilter.query)
             searchInput.setSelection(searchInput.text.length)
         }
-        searchRow.visibility = if (searchOpen) VISIBLE else GONE
-        filterSheet.visibility = if (sheetOpen) VISIBLE else GONE
         if (sheetOpen) rebuildFacets()
         styleFilterChrome()
+        updateStatsDot()
         renderAll()
         AdLogStore.addListener(listener)
         attachedViews += this
         // The FRC view survives navigation; the cached read is drawn above, this refreshes it.
         if (frcOpen && !collapsed) loadRemoteConfig()
+        if (toolsOpen && !collapsed) refreshConsent()
+        updateStatsTicker()
+        updateWhereTicker()
     }
 
     override fun onDetachedFromWindow() {
@@ -1738,8 +2286,12 @@ class AdLogView(context: Context) : FrameLayout(context) {
         AdLogStore.removeListener(listener)
         removeCallbacks(flush)
         removeCallbacks(reRender)
-        frcScope?.cancel()
-        frcScope = null
+        removeCallbacks(statsRender)
+        removeCallbacks(statsTicker)
+        removeCallbacks(whereTicker)
+        removeCallbacks(disarm)
+        ioScope?.cancel()
+        ioScope = null
         super.onDetachedFromWindow()
     }
 }

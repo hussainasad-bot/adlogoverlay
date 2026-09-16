@@ -50,12 +50,18 @@ kotlin {
 dependencies {
     implementation(libs.kotlinx.coroutines.core)
 
-    // compileOnly: not on a consumer's classpath and not in the published POM. The overlay reads
-    // the HOST's own copy at runtime, and the FRC tab only appears when the host has one. Every
-    // Firebase reference lives in FirebaseRemoteConfigReader.kt, loaded only after a
-    // Class.forName check.
+    // compileOnly: not on a consumer's classpath and not in the published POM. The overlay uses
+    // the HOST's own copies at runtime, and each feature only appears when the host has the SDK.
+    // Every reference lives in one file per SDK, loaded only after a Class.forName check:
+    //   Firebase Remote Config -> FirebaseRemoteConfigReader.kt  (FRC tab)
+    //   Google Mobile Ads      -> MobileAdsInspector.kt          (TOOLS > AD INSPECTOR)
+    //   User Messaging Platform-> UmpConsentReader.kt            (TOOLS > CONSENT)
+    //   AndroidX Fragment      -> AndroidxFragments.kt           (fragment on the SCREEN line)
     compileOnly(platform(libs.firebase.bom))
     compileOnly(libs.firebase.config)
+    compileOnly(libs.play.services.ads.api)
+    compileOnly(libs.user.messaging.platform)
+    compileOnly(libs.androidx.fragment)
 
     testImplementation(libs.junit)
 }
