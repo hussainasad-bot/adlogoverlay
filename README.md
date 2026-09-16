@@ -71,7 +71,7 @@ dependencyResolutionManagement {
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    debugImplementation("com.9dtechnologies:adlogoverlay:1.0.1")
+    debugImplementation("com.9dtechnologies:adlogoverlay:1.1.0")
 }
 ```
 
