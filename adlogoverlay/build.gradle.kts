@@ -60,7 +60,27 @@ dependencies {
     testImplementation(libs.junit)
 }
 
-val versionName = providers.gradleProperty("VERSION_NAME").get()
+// ---- Versions ---------------------------------------------------------------------------------
+//
+// VERSION_NAME in gradle.properties is the version published. -Pbump=patch|minor|major raises it
+// for this build only; publishNewVersion writes the raised value back once the upload succeeded,
+// so a failed publish never leaves gradle.properties claiming a version that does not exist.
+val baseVersion = providers.gradleProperty("VERSION_NAME").get()
+val bump = providers.gradleProperty("bump").orNull?.trim()?.lowercase()
+val versionName = if (bump == null) baseVersion else bumpVersion(baseVersion, bump)
+
+fun bumpVersion(version: String, part: String): String {
+    val match = Regex("""(\d+)\.(\d+)\.(\d+)""").matchEntire(version)
+        ?: throw GradleException("VERSION_NAME '$version' is not MAJOR.MINOR.PATCH, so it cannot be bumped")
+    val (major, minor, patch) = match.destructured.toList().map { it.toInt() }
+    return when (part) {
+        "major" -> "${major + 1}.0.0"
+        "minor" -> "$major.${minor + 1}.0"
+        "patch" -> "$major.$minor.${patch + 1}"
+        else -> throw GradleException("-Pbump must be patch, minor or major, not '$part'")
+    }
+}
+
 val githubRepo = providers.gradleProperty("GITHUB_REPO").orNull?.trim()?.takeIf { it.isNotEmpty() }
 // Set in CI from secrets as ORG_GRADLE_PROJECT_signingInMemoryKey; locally via ~/.gradle/gradle.properties.
 // Blank counts as absent: an empty CI secret would otherwise fail deep inside signing with
@@ -141,4 +161,72 @@ val checkReleaseMetadata = tasks.register("checkReleaseMetadata") {
 }
 tasks.matching { it.name.contains("MavenCentral") }.configureEach {
     dependsOn(checkReleaseMetadata)
+}
+
+// ---- Publishing to GitHub Packages --------------------------------------------------------------
+//
+//   ./gradlew publishNewVersion                  tests, then publishes VERSION_NAME as it is
+//   ./gradlew publishNewVersion -Pbump=patch     1.0.0 -> 1.0.1: tests, publishes, saves it
+//   ./gradlew publishNewVersion -Pbump=minor     1.0.0 -> 1.1.0
+//   ./gradlew publishNewVersion -Pbump=major     1.0.0 -> 2.0.0
+//
+// Credentials: gpr.user and gpr.key (a token with write:packages) in ~/.gradle/gradle.properties,
+// or GITHUB_ACTOR and GITHUB_TOKEN in CI. GitHub Packages refuses to overwrite a version that
+// already exists, so publishing the same version twice fails instead of replacing a release.
+val githubUser = providers.gradleProperty("gpr.user").orNull ?: System.getenv("GITHUB_ACTOR")
+val githubToken = providers.gradleProperty("gpr.key").orNull ?: System.getenv("GITHUB_TOKEN")
+
+publishing {
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/${githubRepo ?: "OWNER/adlogoverlay"}")
+            credentials {
+                username = githubUser
+                password = githubToken
+            }
+        }
+    }
+}
+
+// Fail with an instruction, not a bare 401 from the registry.
+val checkGitHubPublishing = tasks.register("checkGitHubPublishing") {
+    val repo = githubRepo
+    val hasCredentials = !githubUser.isNullOrBlank() && !githubToken.isNullOrBlank()
+    doFirst {
+        if (repo == null) {
+            throw GradleException("GITHUB_REPO is empty in gradle.properties. Set it to <owner>/<repo>.")
+        }
+        if (!hasCredentials) {
+            throw GradleException(
+                "No GitHub credentials. Put gpr.user and gpr.key (a token with write:packages) in " +
+                    "~/.gradle/gradle.properties, or set GITHUB_ACTOR and GITHUB_TOKEN."
+            )
+        }
+    }
+}
+tasks.matching { it.name.contains("GitHubPackages") }.configureEach {
+    dependsOn(checkGitHubPublishing)
+    // Never upload a version whose tests have not passed in this same build.
+    mustRunAfter("testDebugUnitTest")
+}
+
+tasks.register("publishNewVersion") {
+    group = "publishing"
+    description = "Runs the unit tests, then publishes VERSION_NAME (or -Pbump=patch|minor|major) to GitHub Packages."
+    dependsOn("testDebugUnitTest", "publishAllPublicationsToGitHubPackagesRepository")
+
+    val propertiesFile = rootProject.file("gradle.properties")
+    val published = versionName
+    val bumped = bump != null
+    val packagesUrl = "https://github.com/${githubRepo ?: "OWNER/adlogoverlay"}/packages"
+    doLast {
+        // Runs only if the tests and the upload both succeeded.
+        if (bumped) {
+            val text = propertiesFile.readText()
+            propertiesFile.writeText(text.replace(Regex("(?m)^VERSION_NAME=.*$"), "VERSION_NAME=$published"))
+            logger.lifecycle("VERSION_NAME is now $published in gradle.properties - commit it.")
+        }
+        logger.lifecycle("Published com.9dtechnologies:adlogoverlay:$published -> $packagesUrl")
+    }
 }

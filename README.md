@@ -17,7 +17,7 @@ holds the phone. This answers it on the device, in the tester's hand.
                       ↳ no fill (request OK, but no inventory) [code 3]
 ```
 
-- **One line to add.** No code: it installs itself.
+- **No code to add.** One dependency line; it installs itself.
 - **Debug builds only.** Added with `debugImplementation`, it is not in a release build at all.
 - **No permissions.** It draws inside the app's own screens, not as a system window.
 - **No AndroidX.** Its only runtime dependency is `kotlinx-coroutines-core`.
@@ -27,6 +27,40 @@ holds the phone. This answers it on the device, in the tester's hand.
 
 ## Install
 
+The library is published to **GitHub Packages**. GitHub requires a token to download any package
+from it, even a public one, so this takes two parts.
+
+**1. Credentials, once per machine.** Create a GitHub personal access token (classic) with the
+`read:packages` scope and add it to `~/.gradle/gradle.properties` — never to the project:
+
+```properties
+gpr.user=your-github-username
+gpr.key=ghp_your_token
+```
+
+On CI, set `GITHUB_USER` and `GITHUB_TOKEN` instead.
+
+**2. The repository and the dependency.**
+
+```kotlin
+// settings.gradle.kts
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven {
+            url = uri("https://maven.pkg.github.com/hussainasad-bot/adlogoverlay")
+            credentials {
+                username = providers.gradleProperty("gpr.user").orNull ?: System.getenv("GITHUB_USER")
+                password = providers.gradleProperty("gpr.key").orNull ?: System.getenv("GITHUB_TOKEN")
+            }
+            // Only this library is looked up here, so other dependencies don't slow down.
+            content { includeGroup("com.9dtechnologies") }
+        }
+    }
+}
+```
+
 ```kotlin
 // app/build.gradle.kts
 dependencies {
@@ -34,7 +68,8 @@ dependencies {
 }
 ```
 
-That is the whole integration. Run a debug build and the `AD` bubble is on every screen.
+That is the whole integration: no code. Run a debug build and the `AD` bubble is on every screen.
+Available versions are listed under **Packages** on the repository page.
 
 Use `debugImplementation`, never `implementation`: it keeps the library out of release builds
 entirely, so there is nothing for R8 to strip and nothing that can reach users.
@@ -301,45 +336,47 @@ Relaunch the app.
 
 ---
 
-## Releasing
+## Publishing a new version
 
-For maintainers. Releases go to Maven Central through the **Publish to Maven Central** workflow.
+For maintainers. One command runs the unit tests and, only if they pass, publishes to this
+repository's GitHub Packages:
 
-### One-time setup
+```bash
+./gradlew publishNewVersion -Pbump=patch    # 1.0.0 -> 1.0.1
+./gradlew publishNewVersion -Pbump=minor    # 1.0.0 -> 1.1.0
+./gradlew publishNewVersion -Pbump=major    # 1.0.0 -> 2.0.0
+./gradlew publishNewVersion                 # publishes VERSION_NAME as it is
+```
 
-1. **Central Portal account** — [register](https://central.sonatype.org/register/central-portal/)
-   at [central.sonatype.com](https://central.sonatype.com/).
-2. **Verify the `com.9dtechnologies` namespace** — Maven Central only accepts it from the owner of
-   `9dtechnologies.com`, proven with a DNS TXT record
-   ([how](https://central.sonatype.org/register/namespace/)).
-3. **Generate a Portal user token**
-   ([how](https://central.sonatype.org/publish/generate-portal-token/)) and add its two parts as
-   repository secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTRAL_PASSWORD`.
-4. **Create a GPG signing key**, publish its public key to a keyserver
-   ([how](https://central.sonatype.org/publish/requirements/gpg/)), and add the ASCII-armoured
-   private key as the secret `SIGNING_KEY` and its passphrase as `SIGNING_KEY_PASSWORD`.
+A bump is written back to `VERSION_NAME` in `gradle.properties` only after the upload succeeds —
+commit that change. GitHub Packages refuses to overwrite a version that already exists, so
+running it twice for the same version fails rather than replacing a release.
 
-### Each release
+It needs `gpr.user` and `gpr.key` in `~/.gradle/gradle.properties`, with a token that has
+`write:packages` and write access to this repository. Without them it stops before uploading
+and says so.
 
-1. Set `VERSION_NAME` in `gradle.properties` and commit.
-2. Tag and push: `git tag v1.0.0 && git push origin v1.0.0`. The tag must match `VERSION_NAME`.
-3. The workflow runs the tests, then uploads the signed release to the Central Portal. **It does
-   not release it.**
-4. On [central.sonatype.com](https://central.sonatype.com/), check the deployment and press
-   **Publish**.
-
-A version published to Maven Central can never be changed or deleted, which is why the last step is
-done by hand. If anything looks wrong, drop the deployment and fix it before publishing.
-
-The build refuses to upload without a signing key or without the repository link the POM needs;
-the workflow provides both.
+`GITHUB_REPO` in `gradle.properties` decides where it publishes; change it if the repository moves.
 
 ### Building locally
 
 ```bash
 ./gradlew :adlogoverlay:testDebugUnitTest :adlogoverlay:assembleRelease
-./gradlew publishToMavenLocal     # unsigned, into ~/.m2, for trying it in another project
+./gradlew publishToMavenLocal     # into ~/.m2, for trying it in another project
 ```
+
+### Maven Central (not set up)
+
+The build can also publish to Maven Central, through the **Publish to Maven Central** workflow,
+which runs when a `v*` tag is pushed. It needs, once: a
+[Central Portal](https://central.sonatype.com/) account, the `com.9dtechnologies` namespace
+[verified](https://central.sonatype.org/register/namespace/) with a DNS TXT record on
+`9dtechnologies.com`, a [Portal user token](https://central.sonatype.org/publish/generate-portal-token/)
+as the secrets `MAVEN_CENTRAL_USERNAME` / `MAVEN_CENTRAL_PASSWORD`, and a
+[GPG key](https://central.sonatype.org/publish/requirements/gpg/) as `SIGNING_KEY` /
+`SIGNING_KEY_PASSWORD`. **Until then, don't push `v*` tags** — the workflow will fail for lack of
+those secrets. It uploads without releasing: a version published to Maven Central can never be
+changed or deleted, so someone presses **Publish** on central.sonatype.com by hand.
 
 ---
 
